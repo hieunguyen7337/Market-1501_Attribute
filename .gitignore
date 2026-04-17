@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.openrouter_cache/
+sample_outputs/
+.env
+*.pyc

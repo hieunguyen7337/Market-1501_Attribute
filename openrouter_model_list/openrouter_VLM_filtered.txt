@@ -1,0 +1,257 @@
+﻿google/gemma-4-26b-a4b-it
+Apr 4, 2026
+262K context
+$0.07/M input tokens
+$0.40/M output tokens
+
+google/gemma-4-31b-it
+Apr 3, 2026
+262K context
+$0.13/M input tokens
+$0.38/M output tokens
+
+qwen/qwen3.6-plus
+Apr 2, 2026
+1M context
+$0.325/M input tokens
+$1.95/M output tokens
+
+z-ai/glm-5v-turbo
+Apr 2, 2026
+203K context
+$1.20/M input tokens
+$4/M output tokens
+
+rekaai/reka-edge
+Mar 21, 2026
+16K context
+$0.10/M input tokens
+$0.10/M output tokens
+
+xiaomi/mimo-v2-omni
+Mar 19, 2026
+262K context
+$0.40/M input tokens
+$2/M output tokens
+
+mistralai/mistral-small-2603
+Mar 17, 2026
+262K context
+$0.15/M input tokens
+$0.60/M output tokens
+
+bytedance-seed/seed-2.0-lite
+Mar 11, 2026
+262K context
+$0.25/M input tokens
+$2/M output tokens
+
+qwen/qwen3.5-9b
+Mar 11, 2026
+256K context
+$0.05/M input tokens
+$0.15/M output tokens
+
+bytedance-seed/seed-2.0-mini
+Feb 27, 2026
+262K context
+$0.10/M input tokens
+$0.40/M output tokens
+
+qwen/qwen3.5-35b-a3b
+Feb 26, 2026
+262K context
+$0.1625/M input tokens
+$1.30/M output tokens
+
+qwen/qwen3.5-27b
+Feb 26, 2026
+262K context
+$0.195/M input tokens
+$1.56/M output tokens
+
+qwen/qwen3.5-122b-a10b
+Feb 26, 2026
+262K context
+$0.26/M input tokens
+$2.08/M output tokens
+
+qwen/qwen3.5-flash-02-23
+Feb 26, 2026
+1M context
+$0.065/M input tokens
+$0.26/M output tokens
+
+qwen/qwen3.5-plus-02-15
+Feb 16, 2026
+1M context
+$0.26/M input tokens
+$1.56/M output tokens
+
+qwen/qwen3.5-397b-a17b
+Feb 16, 2026
+262K context
+$0.39/M input tokens
+$2.34/M output tokens
+
+moonshotai/kimi-k2.5
+Jan 27, 2026
+262K context
+$0.3827/M input tokens
+$1.72/M output tokens
+
+bytedance-seed/seed-1.6-flash
+Dec 24, 2025
+262K context
+$0.075/M input tokens
+$0.30/M output token
+
+bytedance-seed/seed-1.6
+Dec 24, 2025
+262K context
+$0.25/M input tokens
+$2/M output tokens
+
+z-ai/glm-4.6v
+Dec 9, 2025
+131K context
+$0.30/M input tokens
+$0.90/M output tokens
+
+amazon/nova-2-lite-v1
+Dec 3, 2025
+1M context
+$0.30/M input tokens
+$2.50/M output tokens
+
+mistralai/ministral-14b-2512
+Dec 2, 2025
+262K context
+$0.20/M input tokens
+$0.20/M output tokens
+
+mistralai/ministral-8b-2512
+Dec 2, 2025
+262K context
+$0.15/M input tokens
+$0.15/M output tokens
+
+mistralai/ministral-3b-2512
+Dec 2, 2025
+131K context
+$0.10/M input tokens
+$0.10/M output tokens
+
+mistralai/mistral-large-2512
+Dec 2, 2025
+262K context
+$0.50/M input tokens
+$1.50/M output tokens
+
+amazon/nova-premier-v1
+Nov 1, 2025
+1M context
+$2.50/M input tokens
+$12.50/M output tokens
+
+perplexity/sonar-pro-search
+Oct 31, 2025
+200K context
+$3/M input tokens
+$15/M output tokens
+
+nvidia/nemotron-nano-12b-v2-vl
+Oct 29, 2025
+131K context
+$0.20/M input tokens
+$0.60/M output tokens
+
+qwen/qwen3-vl-32b-instruct
+Oct 24, 2025
+131K context
+$0.104/M input tokens
+$0.416/M output tokens
+
+qwen/qwen3-vl-8b-thinking
+Oct 15, 2025
+131K context
+$0.117/M input tokens
+$1.365/M output tokens
+
+qwen/qwen3-vl-8b-instruct
+Oct 15, 2025
+131K context
+$0.08/M input tokens
+$0.50/M output tokens
+
+qwen/qwen3-vl-30b-a3b-thinking
+Oct 7, 2025
+131K context
+$0.13/M input tokens
+$1.56/M output tokens
+
+qwen/qwen3-vl-30b-a3b-instruct
+Oct 7, 2025
+131K context
+$0.13/M input tokens
+$0.52/M output tokens
+
+qwen/qwen3-vl-235b-a22b-thinking
+Sep 24, 2025
+131K context
+$0.26/M input tokens
+$2.60/M output tokens
+
+qwen/qwen3-vl-235b-a22b-instruct
+Sep 24, 2025
+262K context
+$0.20/M input tokens
+$0.88/M output tokens
+
+mistralai/mistral-medium-3.1
+Aug 14, 2025
+131K context
+$0.40/M input tokens
+$2/M output tokens
+
+baidu/ernie-4.5-vl-28b-a3b
+Aug 13, 2025
+30K context
+$0.14/M input tokens
+$0.56/M output tokens
+
+z-ai/glm-4.5v
+Aug 12, 2025
+66K context
+$0.60/M input tokens
+$1.80/M output tokens
+
+bytedance/ui-tars-1.5-7b
+Jul 23, 2025
+128K context
+$0.10/M input tokens
+$0.20/M output tokens
+
+baidu/ernie-4.5-vl-424b-a47b
+Jul 1, 2025
+123K context
+$0.42/M input tokens
+$1.25/M output tokens
+
+mistralai/mistral-small-3.2-24b-instruct
+Jun 21, 2025
+128K context
+$0.075/M input tokens
+$0.20/M output tokens
+
+mistralai/mistral-medium-3
+May 8, 2025
+131K context
+$0.40/M input tokens
+$2/M output tokens
+
+arcee-ai/spotlight
+May 6, 2025
+131K context
+$0.18/M input tokens
+$0.18/M output tokens

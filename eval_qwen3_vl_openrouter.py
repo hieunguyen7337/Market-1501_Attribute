@@ -16,9 +16,11 @@ import base64
 import json
 import os
 import re
+import socket
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -28,7 +30,8 @@ import scipy.io as sio
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "qwen/qwen3-vl-32b-instruct"
+DEFAULT_MODEL = "qwen/qwen3.5-9b"
+INVALID_PREDICTION_VALUE = -1
 PREDICTION_COLUMNS = [
     "gender",
     "hair",
@@ -45,43 +48,29 @@ PREDICTION_COLUMNS = [
 ]
 
 
-PROMPT = """Return only a compact JSON object with integer fields:
+PROMPT = """Label every attribute of the main pedestrian in this image.
+If multiple people are visible, focus on the most prominent (largest/most central) person.
+If a body region is occluded or cropped, infer from whatever is visible.
+
+Return only a raw JSON object with these exact keys and text values:
+
 {
-  "gender": 1|2,
-  "hair": 1|2,
-  "age": 1|2|3|4,
-  "up": 1|2,
-  "down": 1|2,
-  "clothes": 1|2,
-  "hat": 1|2,
-  "backpack": 1|2,
-  "bag": 1|2,
-  "handbag": 1|2,
-  "up_color": 1|2|3|4|5|6|7|8,
-  "down_color": 1|2|3|4|5|6|7|8|9
+  "gender":                    "male" | "female",
+  "hair":                      "short" | "long",
+  "age":                       "young" | "teenager" | "adult" | "old",
+  "clothing_type":             "dress" | "pants",
+  "upper_body_clothes":        "long sleeve" | "short sleeve",
+  "lower_body_clothes":        "long" | "short",
+  "hat":                       "no" | "yes",
+  "backpack":                  "no" | "yes",
+  "bag":                       "no" | "yes",
+  "handbag":                   "no" | "yes",
+  "upper_body_clothes_color":  "black" | "white" | "red" | "purple" | "gray" | "blue" | "green" | "yellow",
+  "lower_body_clothes_color":  "black" | "white" | "pink" | "gray" | "blue" | "green" | "brown" | "yellow" | "purple"
 }
 
-You are labeling one pedestrian image for the Market-1501 attribute benchmark.
-Use these exact dataset labels:
-- gender: male=1, female=2
-- hair: short hair=1, long hair=2
-- up: long sleeve=1, short sleeve=2
-- down: long lower-body clothing=1, short=2
-- clothes: dress=1, pants=2
-- hat: no=1, yes=2
-- backpack: no=1, yes=2
-- bag: no=1, yes=2
-- handbag: no=1, yes=2
-- age: young=1, teenager=2, adult=3, old=4
-- up_color:
-  1=black, 2=white, 3=red, 4=purple, 5=gray, 6=blue, 7=green, 8=yellow
-- down_color:
-  1=black, 2=white, 3=pink, 4=gray, 5=blue, 6=green, 7=brown, 8=yellow, 9=purple
-
-Rules:
-- Pick exactly one value for every field.
-- If uncertain, still choose the single best label.
-- Do not include markdown fences or any explanation.
+For upper_body_clothes_color and lower_body_clothes_color, choose the dominant color.
+No markdown, no explanation - raw JSON only.
 """
 
 
@@ -89,11 +78,52 @@ class EvalError(RuntimeError):
     """Raised when evaluation data or model output is invalid."""
 
 
+class InvalidFormatError(EvalError):
+    """Raised when the model does not return a parseable prediction format."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        responses: List[Dict[str, Any]] | None = None,
+        request_payload: Dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.responses = responses or []
+        self.request_payload = request_payload or {}
+
+
+class RequestFailureError(EvalError):
+    """Raised when the API request fails after retries."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        responses: List[Dict[str, Any]] | None = None,
+        request_payload: Dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.responses = responses or []
+        self.request_payload = request_payload or {}
+
+
 @dataclass(frozen=True)
 class GalleryItem:
     image_path: Path
     pid: int
     class_index: int
+
+
+@dataclass(frozen=True)
+class RequestArtifacts:
+    prediction: Dict[str, int]
+    responses: List[Dict[str, Any]]
+    request_payload: Dict[str, Any]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -137,7 +167,10 @@ def parse_args() -> argparse.Namespace:
         "--images-dir",
         type=Path,
         default=None,
-        help="Path to bounding_box_test. Defaults to <dataset-root>/bounding_box_test.",
+        help=(
+            "Path to bounding_box_test. Defaults to MARKET1501_IMAGES_DIR or "
+            "<dataset-root>/data/Market-1501-v15.09.15/bounding_box_test."
+        ),
     )
     parser.add_argument(
         "--output-mat",
@@ -150,12 +183,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("market_attribute_metrics.json"),
         help="Optional JSON file to save per-attribute metrics.",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        default=Path(".openrouter_cache"),
-        help="Directory for per-image JSON predictions.",
     )
     parser.add_argument(
         "--model",
@@ -196,7 +223,7 @@ def parse_args() -> argparse.Namespace:
         help="HTTP timeout in seconds.",
     )
     parser.add_argument(
-        "--max-retries",
+        "--request-retries",
         type=int,
         default=4,
         help="Retries per image on transient API failures.",
@@ -214,14 +241,10 @@ def parse_args() -> argparse.Namespace:
         help="Only evaluate the first N valid gallery images.",
     )
     parser.add_argument(
-        "--overwrite-cache",
-        action="store_true",
-        help="Ignore cached predictions and request everything again.",
-    )
-    parser.add_argument(
-        "--skip-api",
-        action="store_true",
-        help="Do not call OpenRouter. Only use cached predictions.",
+        "--run-log-dir",
+        type=Path,
+        default=Path("eval_runs"),
+        help="Directory for per-run JSON logs with config, timing, outputs, and metrics.",
     )
     return parser.parse_args()
 
@@ -229,11 +252,14 @@ def parse_args() -> argparse.Namespace:
 def resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, Path]:
     dataset_root = args.dataset_root.resolve()
     mat_path = (args.mat_path or (dataset_root / "market_attribute.mat")).resolve()
-    images_dir = (args.images_dir or (dataset_root / "bounding_box_test")).resolve()
+    images_dir_input = args.images_dir or os.environ.get("MARKET1501_IMAGES_DIR")
+    if images_dir_input is None:
+        images_dir_input = dataset_root / "data" / "Market-1501-v15.09.15" / "bounding_box_test"
+    images_dir = Path(images_dir_input).resolve()
     output_mat = args.output_mat.resolve()
     metrics_json = args.metrics_json.resolve()
-    cache_dir = args.cache_dir.resolve()
-    return mat_path, images_dir, output_mat, metrics_json, cache_dir
+    run_log_dir = args.run_log_dir.resolve()
+    return mat_path, images_dir, output_mat, metrics_json, run_log_dir
 
 
 def require_path(path: Path, description: str) -> None:
@@ -342,7 +368,7 @@ def encode_image_to_data_url(image_path: Path) -> str:
 def parse_json_object(text: str) -> Dict[str, Any]:
     text = text.strip()
     if not text:
-        raise EvalError("Model returned an empty response")
+        raise InvalidFormatError("Model returned an empty response")
 
     try:
         parsed = json.loads(text)
@@ -353,46 +379,181 @@ def parse_json_object(text: str) -> Dict[str, Any]:
 
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        raise EvalError(f"Could not find JSON object in model response: {text!r}")
+        raise InvalidFormatError(f"Could not find JSON object in model response: {text!r}")
 
     try:
         parsed = json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        raise EvalError(f"Invalid JSON in model response: {text!r}") from exc
+        raise InvalidFormatError(f"Invalid JSON in model response: {text!r}") from exc
 
     if not isinstance(parsed, dict):
-        raise EvalError(f"Expected a JSON object, got: {type(parsed).__name__}")
+        raise InvalidFormatError(f"Expected a JSON object, got: {type(parsed).__name__}")
     return parsed
 
 
+def compact_json(data: Any, limit: int = 800) -> str:
+    try:
+        text = json.dumps(data, ensure_ascii=True, sort_keys=True)
+    except TypeError:
+        text = str(data)
+    if len(text) > limit:
+        return text[:limit] + "...<truncated>"
+    return text
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def build_request_record(
+    payload: Dict[str, Any],
+    http_referer: str | None,
+    app_title: str | None,
+) -> Dict[str, Any]:
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer <redacted>"}
+    if http_referer:
+        headers["HTTP-Referer"] = http_referer
+    if app_title:
+        headers["X-Title"] = app_title
+    return {"url": OPENROUTER_URL, "headers": headers, "json": payload}
+
+
+def extract_message_text(body: Dict[str, Any]) -> str:
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise InvalidFormatError(f"OpenRouter response missing choices: {compact_json(body)}")
+
+    choice0 = choices[0]
+    if not isinstance(choice0, dict):
+        raise InvalidFormatError(f"Unexpected choice payload: {compact_json(choice0)}")
+
+    message = choice0.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            text_parts: List[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    if part.strip():
+                        text_parts.append(part)
+                    continue
+                if not isinstance(part, dict):
+                    continue
+                for key in ("text", "content", "output_text"):
+                    value = part.get(key)
+                    if isinstance(value, str) and value.strip():
+                        text_parts.append(value)
+                if part.get("type") == "text":
+                    value = part.get("text")
+                    if isinstance(value, str) and value.strip():
+                        text_parts.append(value)
+            merged = "\n".join(text_parts).strip()
+            if merged:
+                return merged
+
+        for key in ("reasoning", "refusal"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+
+    for key in ("text",):
+        value = choice0.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+
+    raise InvalidFormatError(
+        "OpenRouter response did not contain parseable text content: "
+        f"{compact_json(choice0)}"
+    )
+
+
 def validate_prediction(raw: Dict[str, Any]) -> Dict[str, int]:
-    ranges = {
-        "gender": (1, 2),
-        "hair": (1, 2),
-        "age": (1, 4),
-        "up": (1, 2),
-        "down": (1, 2),
-        "clothes": (1, 2),
-        "hat": (1, 2),
-        "backpack": (1, 2),
-        "bag": (1, 2),
-        "handbag": (1, 2),
-        "up_color": (1, 8),
-        "down_color": (1, 9),
+    key_remap = {
+        "upper_body_clothes": "up",
+        "lower_body_clothes": "down",
+        "clothing_type": "clothes",
+        "upper_body_clothes_color": "up_color",
+        "lower_body_clothes_color": "down_color",
+    }
+    label_maps = {
+        "gender": {"male": 1, "female": 2},
+        "hair": {"short": 1, "long": 2},
+        "age": {"young": 1, "teenager": 2, "adult": 3, "old": 4},
+        "up": {"long sleeve": 1, "short sleeve": 2},
+        "down": {"long": 1, "short": 2},
+        "clothes": {"dress": 1, "pants": 2},
+        "hat": {"no": 1, "yes": 2},
+        "backpack": {"no": 1, "yes": 2},
+        "bag": {"no": 1, "yes": 2},
+        "handbag": {"no": 1, "yes": 2},
+        "up_color": {
+            "black": 1,
+            "white": 2,
+            "red": 3,
+            "purple": 4,
+            "gray": 5,
+            "blue": 6,
+            "green": 7,
+            "yellow": 8,
+        },
+        "down_color": {
+            "black": 1,
+            "white": 2,
+            "pink": 3,
+            "gray": 4,
+            "blue": 5,
+            "green": 6,
+            "brown": 7,
+            "yellow": 8,
+            "purple": 9,
+        },
     }
 
+    normalized_raw: Dict[str, Any] = {}
+    for key, value in raw.items():
+        mapped_key = key_remap.get(key, key)
+        normalized_raw[mapped_key] = value
+
+    clothes_value = normalized_raw.get("clothes")
+    if isinstance(clothes_value, str) and " ".join(clothes_value.strip().lower().split()) == "dress":
+        normalized_raw["down"] = "long"
+
     pred: Dict[str, int] = {}
-    for key, (low, high) in ranges.items():
-        if key not in raw:
-            raise EvalError(f"Missing key '{key}' in model response")
+    for key, mapping in label_maps.items():
+        if key not in normalized_raw:
+            raise InvalidFormatError(f"Missing key '{key}' in model response")
+
+        value = normalized_raw[key]
+        if isinstance(value, str):
+            normalized = " ".join(value.strip().lower().split())
+            if normalized not in mapping:
+                raise InvalidFormatError(
+                    f"Unexpected label for '{key}': {value!r}. Expected one of {sorted(mapping)}"
+                )
+            pred[key] = mapping[normalized]
+            continue
+
         try:
-            value = int(raw[key])
+            numeric_value = int(value)
         except (TypeError, ValueError) as exc:
-            raise EvalError(f"Non-integer value for '{key}': {raw[key]!r}") from exc
-        if value < low or value > high:
-            raise EvalError(f"Value for '{key}' out of range [{low}, {high}]: {value}")
-        pred[key] = value
+            raise InvalidFormatError(
+                f"Value for '{key}' must be a string label or integer: {value!r}"
+            ) from exc
+
+        if numeric_value not in mapping.values():
+            raise InvalidFormatError(
+                f"Integer value for '{key}' out of range: {numeric_value}"
+            )
+        pred[key] = numeric_value
+
     return pred
+
+
+def invalid_prediction() -> Dict[str, int]:
+    return {key: INVALID_PREDICTION_VALUE for key in PREDICTION_COLUMNS}
 
 
 def request_prediction(
@@ -402,10 +563,10 @@ def request_prediction(
     timeout: int,
     temperature: float,
     max_tokens: int,
-    max_retries: int,
+    request_retries: int,
     http_referer: str | None,
     app_title: str | None,
-) -> Dict[str, int]:
+) -> RequestArtifacts:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -434,7 +595,8 @@ def request_prediction(
     }
 
     last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
+    response_log: List[Dict[str, Any]] = []
+    for attempt in range(1, request_retries + 1):
         try:
             response = requests.post(
                 OPENROUTER_URL,
@@ -444,72 +606,193 @@ def request_prediction(
             )
             response.raise_for_status()
             body = response.json()
-            content = body["choices"][0]["message"]["content"]
-            return validate_prediction(parse_json_object(content))
+            response_log.append(
+                {
+                    "stage": "request_attempt",
+                    "request_attempt": attempt,
+                    "format_attempt": 1,
+                    "response": body,
+                }
+            )
+            format_error: Exception | None = None
+            for format_attempt in range(1, 3):
+                try:
+                    content = extract_message_text(body)
+                    return RequestArtifacts(
+                        prediction=validate_prediction(parse_json_object(content)),
+                        responses=response_log,
+                        request_payload=payload,
+                    )
+                except InvalidFormatError as exc:
+                    format_error = exc
+                    if format_attempt == 1:
+                        print(
+                            f"[warn] invalid format for {image_path.name} "
+                            f"(format attempt 1/2), retrying once: {exc}",
+                            file=sys.stderr,
+                        )
+                        response = requests.post(
+                            OPENROUTER_URL,
+                            headers=headers,
+                            json=payload,
+                            timeout=timeout,
+                        )
+                        response.raise_for_status()
+                        body = response.json()
+                        response_log.append(
+                            {
+                                "stage": "format_retry",
+                                "request_attempt": attempt,
+                                "format_attempt": 2,
+                                "response": body,
+                            }
+                        )
+                    else:
+                        raise InvalidFormatError(
+                            f"Invalid format after 2 attempts: {format_error}",
+                            responses=response_log,
+                            request_payload=payload,
+                        ) from format_error
+        except InvalidFormatError:
+            raise
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            if attempt == max_retries:
+            if attempt == request_retries:
                 break
             backoff = min(30.0, 2 ** (attempt - 1))
             print(
-                f"[warn] request failed for {image_path.name} (attempt {attempt}/{max_retries}): {exc}",
+                f"[warn] request failed for {image_path.name} "
+                f"(attempt {attempt}/{request_retries}): {exc}",
                 file=sys.stderr,
             )
             time.sleep(backoff)
 
-    raise EvalError(f"OpenRouter request failed for {image_path}: {last_error}")
-
-
-def cache_path(cache_dir: Path, image_path: Path) -> Path:
-    return cache_dir / f"{image_path.stem}.json"
-
-
-def load_cached_prediction(path: Path) -> Dict[str, int]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise EvalError(f"Cache file is not a JSON object: {path}")
-    return validate_prediction(data)
-
-
-def save_cached_prediction(path: Path, prediction: Dict[str, int]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(prediction, indent=2, sort_keys=True), encoding="utf-8")
+    raise RequestFailureError(
+        f"OpenRouter request failed for {image_path}: {last_error}",
+        responses=response_log,
+        request_payload=payload,
+    )
 
 
 def collect_predictions(
     gallery_items: Sequence[GalleryItem],
     args: argparse.Namespace,
-    cache_dir: Path,
+    run_log: Dict[str, Any],
+    run_artifact_dir: Path,
 ) -> List[Dict[str, int]]:
     predictions: List[Dict[str, int]] = []
+    format_failures: List[Dict[str, Any]] = []
+    request_failures: List[Dict[str, Any]] = []
+    api_response_dir = run_artifact_dir / "api_responses"
+    request_payload_written = False
 
-    if not args.api_key and not args.skip_api:
+    if not args.api_key:
         raise EvalError("OpenRouter API key missing. Pass --api-key or set OPENROUTER_API_KEY.")
 
     for index, item in enumerate(gallery_items, start=1):
-        one_cache_path = cache_path(cache_dir, item.image_path)
-        prediction: Dict[str, int] | None = None
-
-        if one_cache_path.exists() and not args.overwrite_cache:
-            prediction = load_cached_prediction(one_cache_path)
-        elif not args.skip_api:
-            prediction = request_prediction(
+        try:
+            artifacts = request_prediction(
                 image_path=item.image_path,
                 model=args.model,
                 api_key=args.api_key,
                 timeout=args.timeout,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
-                max_retries=args.max_retries,
+                request_retries=args.request_retries,
                 http_referer=args.http_referer,
                 app_title=args.app_title,
             )
-            save_cached_prediction(one_cache_path, prediction)
+            prediction = artifacts.prediction
+            if not request_payload_written:
+                write_json(
+                    run_artifact_dir / "api_request_template.json",
+                    build_request_record(artifacts.request_payload, args.http_referer, args.app_title),
+                )
+                request_payload_written = True
+            write_json(
+                api_response_dir / f"{index:05d}_{item.image_path.stem}.json",
+                {
+                    "image_path": str(item.image_path),
+                    "request_index": index,
+                    "model": args.model,
+                    "responses": artifacts.responses,
+                    "final_prediction": prediction,
+                },
+            )
             if args.sleep_seconds > 0:
                 time.sleep(args.sleep_seconds)
-        else:
-            raise EvalError(
-                f"Missing cache for {item.image_path.name} and --skip-api was set."
+        except InvalidFormatError as exc:
+            prediction = invalid_prediction()
+            message = str(exc)
+            format_failures.append({"image_path": str(item.image_path), "error": message})
+            if not request_payload_written and exc.request_payload:
+                write_json(
+                    run_artifact_dir / "api_request_template.json",
+                    build_request_record(exc.request_payload, args.http_referer, args.app_title),
+                )
+                request_payload_written = True
+            write_json(
+                api_response_dir / f"{index:05d}_{item.image_path.stem}.json",
+                {
+                    "image_path": str(item.image_path),
+                    "request_index": index,
+                    "model": args.model,
+                    "error_type": "InvalidFormatError",
+                    "error": message,
+                    "responses": exc.responses,
+                    "request_payload": exc.request_payload,
+                    "final_prediction": prediction,
+                },
+            )
+            print(
+                f"[warn] counting {item.image_path.name} as all incorrect due to invalid format: {message}",
+                file=sys.stderr,
+            )
+        except RequestFailureError as exc:
+            prediction = invalid_prediction()
+            message = str(exc)
+            request_failures.append({"image_path": str(item.image_path), "error": message})
+            if not request_payload_written and exc.request_payload:
+                write_json(
+                    run_artifact_dir / "api_request_template.json",
+                    build_request_record(exc.request_payload, args.http_referer, args.app_title),
+                )
+                request_payload_written = True
+            write_json(
+                api_response_dir / f"{index:05d}_{item.image_path.stem}.json",
+                {
+                    "image_path": str(item.image_path),
+                    "request_index": index,
+                    "model": args.model,
+                    "error_type": type(exc).__name__,
+                    "error": message,
+                    "responses": exc.responses,
+                    "request_payload": exc.request_payload,
+                    "final_prediction": prediction,
+                },
+            )
+            print(
+                f"[warn] counting {item.image_path.name} as all incorrect due to request failure: {message}",
+                file=sys.stderr,
+            )
+        except EvalError as exc:
+            prediction = invalid_prediction()
+            message = str(exc)
+            request_failures.append({"image_path": str(item.image_path), "error": message})
+            write_json(
+                api_response_dir / f"{index:05d}_{item.image_path.stem}.json",
+                {
+                    "image_path": str(item.image_path),
+                    "request_index": index,
+                    "model": args.model,
+                    "error_type": type(exc).__name__,
+                    "error": message,
+                    "final_prediction": prediction,
+                },
+            )
+            print(
+                f"[warn] counting {item.image_path.name} as all incorrect due to request failure: {message}",
+                file=sys.stderr,
             )
 
         predictions.append(prediction)
@@ -518,6 +801,12 @@ def collect_predictions(
             f"{json.dumps(prediction, sort_keys=True)}"
         )
 
+    run_log["prediction_failures"] = {
+        "invalid_format_count": len(format_failures),
+        "request_failure_count": len(request_failures),
+        "invalid_format_samples": format_failures,
+        "request_failure_samples": request_failures,
+    }
     return predictions
 
 
@@ -570,6 +859,62 @@ def compute_metrics(gallery: np.ndarray, gt: Dict[str, np.ndarray]) -> Dict[str,
     return metrics
 
 
+def compute_error_breakdown(gallery: np.ndarray, gt: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    format_invalid_mask = np.any(gallery == INVALID_PREDICTION_VALUE, axis=1)
+
+    up_color_correct = (
+        ((gallery[:, 10] == 1) & (gt["upblack"] == 2))
+        | ((gallery[:, 10] == 2) & (gt["upwhite"] == 2))
+        | ((gallery[:, 10] == 3) & (gt["upred"] == 2))
+        | ((gallery[:, 10] == 4) & (gt["uppurple"] == 2))
+        | ((gallery[:, 10] == 5) & (gt["upgray"] == 2))
+        | ((gallery[:, 10] == 6) & (gt["upblue"] == 2))
+        | ((gallery[:, 10] == 7) & (gt["upgreen"] == 2))
+        | ((gallery[:, 10] == 8) & (gt["upyellow"] == 2))
+    )
+    down_color_correct = (
+        ((gallery[:, 11] == 1) & (gt["downblack"] == 2))
+        | ((gallery[:, 11] == 2) & (gt["downwhite"] == 2))
+        | ((gallery[:, 11] == 3) & (gt["downpink"] == 2))
+        | ((gallery[:, 11] == 4) & (gt["downgray"] == 2))
+        | ((gallery[:, 11] == 5) & (gt["downblue"] == 2))
+        | ((gallery[:, 11] == 6) & (gt["downgreen"] == 2))
+        | ((gallery[:, 11] == 7) & (gt["downbrown"] == 2))
+        | ((gallery[:, 11] == 8) & (gt["downyellow"] == 2))
+        | ((gallery[:, 11] == 9) & (gt["downpurple"] == 2))
+    )
+
+    attr_correct = np.column_stack(
+        [
+            gallery[:, 0] == gt["gender"],
+            gallery[:, 2] == gt["age"],
+            gallery[:, 1] == gt["hair"],
+            gallery[:, 3] == gt["up"],
+            gallery[:, 4] == gt["down"],
+            gallery[:, 5] == gt["clothes"],
+            gallery[:, 7] == gt["backpack"],
+            gallery[:, 9] == gt["handbag"],
+            gallery[:, 8] == gt["bag"],
+            gallery[:, 6] == gt["hat"],
+            up_color_correct,
+            down_color_correct,
+        ]
+    )
+
+    exact_match_mask = np.all(attr_correct, axis=1)
+    valid_but_inaccurate_mask = (~format_invalid_mask) & (~exact_match_mask)
+
+    return {
+        "total_samples": int(len(gallery)),
+        "invalid_format_or_failure_count": int(np.sum(format_invalid_mask)),
+        "invalid_format_or_failure_rate": float(np.mean(format_invalid_mask)),
+        "valid_but_inaccurate_count": int(np.sum(valid_but_inaccurate_mask)),
+        "valid_but_inaccurate_rate": float(np.mean(valid_but_inaccurate_mask)),
+        "exact_match_count": int(np.sum(exact_match_mask)),
+        "exact_match_rate": float(np.mean(exact_match_mask)),
+    }
+
+
 def write_metrics(path: Path, metrics: Dict[str, float], gallery_size: int, model: str) -> None:
     payload = {
         "model": model,
@@ -601,8 +946,61 @@ def print_metrics(metrics: Dict[str, float]) -> None:
         print(f"{key:>10}: {metrics[key]:.6f}")
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return str(value)
+
+
+def build_run_log_base(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "started_at_utc": utc_now_iso(),
+        "command": " ".join(sys.argv),
+        "cwd": str(Path.cwd()),
+        "hostname": socket.gethostname(),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "arguments": {
+            key: json_safe(value) for key, value in vars(args).items()
+        },
+        "environment": {
+            "OPENROUTER_API_KEY_present": bool(os.environ.get("OPENROUTER_API_KEY")),
+            "OPENROUTER_HTTP_REFERER": os.environ.get("OPENROUTER_HTTP_REFERER"),
+            "OPENROUTER_APP_TITLE": os.environ.get("OPENROUTER_APP_TITLE"),
+            "MARKET1501_IMAGES_DIR": os.environ.get("MARKET1501_IMAGES_DIR"),
+        },
+    }
+
+
+def write_run_log(run_artifact_dir: Path, run_log: Dict[str, Any]) -> Path:
+    run_artifact_dir.mkdir(parents=True, exist_ok=True)
+    status = str(run_log.get("status", "unknown"))
+    log_path = run_artifact_dir / f"run_log_{status}.json"
+    log_path.write_text(json.dumps(run_log, indent=2, sort_keys=True), encoding="utf-8")
+    return log_path
+
+
+def make_run_artifact_dir(run_log_dir: Path, model: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_slug = model.replace("/", "__")
+    artifact_dir = run_log_dir / f"{timestamp}_{model_slug}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir
+
+
 def main() -> int:
     args = parse_args()
+    run_started = time.time()
+    run_log = build_run_log_base(args)
+    exit_code = 1
+    run_log_path: Path | None = None
+    run_artifact_dir: Path | None = None
 
     try:
         dataset_root = args.dataset_root.resolve()
@@ -614,31 +1012,94 @@ def main() -> int:
         if args.app_title == "Market1501 Attribute Eval":
             args.app_title = os.environ.get("OPENROUTER_APP_TITLE", args.app_title)
 
-        mat_path, images_dir, output_mat, metrics_json, cache_dir = resolve_paths(args)
+        mat_path, images_dir, output_mat, metrics_json, run_log_dir = resolve_paths(args)
+        run_artifact_dir = make_run_artifact_dir(run_log_dir, args.model)
+        run_log["resolved_paths"] = {
+            "dataset_root": str(dataset_root),
+            "mat_path": str(mat_path),
+            "images_dir": str(images_dir),
+            "output_mat": str(output_mat),
+            "metrics_json": str(metrics_json),
+            "run_log_dir": str(run_log_dir),
+            "run_artifact_dir": str(run_artifact_dir),
+        }
+        run_log["model"] = args.model
         require_path(mat_path, "Attribute MAT file")
         require_path(images_dir, "Gallery image directory")
 
         market = load_market_attribute(mat_path)
         gallery_items = list_gallery_items(images_dir, limit=args.limit)
+        run_log["gallery"] = {
+            "num_items": len(gallery_items),
+            "first_image": str(gallery_items[0].image_path),
+            "last_image": str(gallery_items[-1].image_path),
+        }
         gt = build_ground_truth(market.test, gallery_items)
 
-        predictions = collect_predictions(gallery_items, args, cache_dir)
+        predictions = collect_predictions(gallery_items, args, run_log, run_artifact_dir)
         gallery = predictions_to_matrix(predictions)
 
         output_mat.parent.mkdir(parents=True, exist_ok=True)
         sio.savemat(str(output_mat), {"gallery": gallery})
 
         metrics = compute_metrics(gallery, gt)
+        error_breakdown = compute_error_breakdown(gallery, gt)
         metrics_json.parent.mkdir(parents=True, exist_ok=True)
         write_metrics(metrics_json, metrics, len(gallery_items), args.model)
+        run_log["outputs"] = {
+            "output_mat": str(output_mat),
+            "metrics_json": str(metrics_json),
+            "api_request_template": str(run_artifact_dir / "api_request_template.json"),
+            "api_response_dir": str(run_artifact_dir / "api_responses"),
+        }
+        run_log["metrics"] = metrics
+        run_log["error_breakdown"] = error_breakdown
+        run_log["status"] = "success"
 
         print(f"\nSaved gallery predictions to: {output_mat}")
         print(f"Saved metrics to: {metrics_json}")
         print_metrics(metrics)
-        return 0
+        print("\nError Breakdown")
+        print("---------------")
+        for key, value in error_breakdown.items():
+            if isinstance(value, float):
+                print(f"{key}: {value:.6f}")
+            else:
+                print(f"{key}: {value}")
+        exit_code = 0
+    except KeyboardInterrupt:
+        run_log["status"] = "aborted"
+        run_log["error_type"] = "KeyboardInterrupt"
+        run_log["error"] = "Run interrupted by user."
+        print("[warn] run interrupted by user.", file=sys.stderr)
     except EvalError as exc:
+        run_log["status"] = "error"
+        run_log["error_type"] = type(exc).__name__
+        run_log["error"] = str(exc)
         print(f"[error] {exc}", file=sys.stderr)
-        return 1
+    except Exception as exc:  # noqa: BLE001
+        run_log["status"] = "error"
+        run_log["error_type"] = type(exc).__name__
+        run_log["error"] = str(exc)
+        raise
+    finally:
+        run_log["finished_at_utc"] = utc_now_iso()
+        run_log["duration_seconds"] = round(time.time() - run_started, 3)
+        if "status" not in run_log:
+            run_log["status"] = "unknown"
+        try:
+            if run_artifact_dir is not None:
+                run_log["run_artifact_dir"] = str(run_artifact_dir)
+                run_log_path = write_run_log(run_artifact_dir, run_log)
+            else:
+                _, _, _, _, run_log_dir = resolve_paths(args)
+                run_log_path = write_run_log(run_log_dir, run_log)
+        except Exception as log_exc:  # noqa: BLE001
+            print(f"[warn] failed to write run log: {log_exc}", file=sys.stderr)
+        else:
+            print(f"Saved run log to: {run_log_path}")
+
+    return exit_code
 
 
 if __name__ == "__main__":

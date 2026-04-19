@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
+import random
 import re
 import socket
 import sys
@@ -47,6 +49,84 @@ PREDICTION_COLUMNS = [
     "down_color",
 ]
 
+AGE_LABELS = {
+    1: "child",
+    2: "teenager",
+    3: "adult",
+    4: "old",
+}
+
+UP_COLOR_LABELS = {
+    1: "black",
+    2: "white",
+    3: "red",
+    4: "purple",
+    5: "gray",
+    6: "blue",
+    7: "green",
+    8: "yellow",
+}
+
+DOWN_COLOR_LABELS = {
+    1: "black",
+    2: "white",
+    3: "pink",
+    4: "gray",
+    5: "blue",
+    6: "green",
+    7: "brown",
+    8: "yellow",
+    9: "purple",
+}
+
+UP_COLOR_GT_FIELDS = [
+    "upblack",
+    "upwhite",
+    "upred",
+    "uppurple",
+    "upgray",
+    "upblue",
+    "upgreen",
+    "upyellow",
+]
+
+DOWN_COLOR_GT_FIELDS = [
+    "downblack",
+    "downwhite",
+    "downpink",
+    "downgray",
+    "downblue",
+    "downgreen",
+    "downbrown",
+    "downyellow",
+    "downpurple",
+]
+
+# Heuristic remaps applied before strict label validation.
+# Allows the model to output natural color/category names that aren't in the
+# dataset's exact label set; a nearest-neighbor remap keeps the prediction
+# instead of zeroing the whole row.
+LABEL_REMAP: Dict[str, Dict[str, str]] = {
+    "up_color":   {"pink": "red", "orange": "red", "brown": "gray"},
+    "down_color": {"red": "pink", "orange": "brown"},
+    "clothes":    {"shorts": "pants", "short": "pants", "skirt": "dress"},
+}
+
+EXPECTED_RESPONSE_KEYS = {
+    "gender",
+    "hair",
+    "age",
+    "clothing_type",
+    "upper_body_clothes",
+    "lower_body_clothes",
+    "hat",
+    "backpack",
+    "bag",
+    "handbag",
+    "upper_body_clothes_color",
+    "lower_body_clothes_color",
+}
+
 
 PROMPT = """Label every attribute of the main pedestrian in this image.
 If multiple people are visible, focus on the most prominent (largest/most central) person.
@@ -57,21 +137,23 @@ Return only a raw JSON object with these exact keys and text values:
 {
   "gender":                    "male" | "female",
   "hair":                      "short" | "long",
-  "age":                       "young" | "teenager" | "adult" | "old",
-  "clothing_type":             "dress" | "pants",
+  "age":                       "child" | "teenager" | "adult" | "old",
+  "clothing_type":             "dress" | "pants" | "shorts" | "skirt",
   "upper_body_clothes":        "long sleeve" | "short sleeve",
   "lower_body_clothes":        "long" | "short",
   "hat":                       "no" | "yes",
   "backpack":                  "no" | "yes",
   "bag":                       "no" | "yes",
   "handbag":                   "no" | "yes",
-  "upper_body_clothes_color":  "black" | "white" | "red" | "purple" | "gray" | "blue" | "green" | "yellow",
-  "lower_body_clothes_color":  "black" | "white" | "pink" | "gray" | "blue" | "green" | "brown" | "yellow" | "purple"
+  "upper_body_clothes_color":  "black" | "white" | "red" | "purple" | "gray" | "blue" | "green" | "yellow" | "pink" | "orange" | "brown",
+  "lower_body_clothes_color":  "black" | "white" | "pink" | "gray" | "blue" | "green" | "brown" | "yellow" | "purple" | "red"
 }
 
 For upper_body_clothes_color and lower_body_clothes_color, choose the dominant color.
 No markdown, no explanation - raw JSON only.
 """
+
+DEFAULT_PROMPT_NAME = "baseline"
 
 
 class EvalError(RuntimeError):
@@ -113,6 +195,7 @@ class GalleryItem:
     image_path: Path
     pid: int
     class_index: int
+    source_index: int
 
 
 @dataclass(frozen=True)
@@ -145,6 +228,38 @@ def load_dotenv(dotenv_path: Path) -> None:
             value = value[1:-1]
 
         os.environ.setdefault(key, value)
+
+
+def slugify_name(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return slug or "prompt"
+
+
+def load_prompt(prompt_file: Path | None) -> Tuple[str, Dict[str, Any]]:
+    if prompt_file is None:
+        prompt_text = PROMPT
+        source = "builtin"
+        resolved_path = None
+        prompt_name = DEFAULT_PROMPT_NAME
+    else:
+        resolved = prompt_file.resolve()
+        if not resolved.exists():
+            raise EvalError(f"Prompt file not found: {resolved}")
+        prompt_text = resolved.read_text(encoding="utf-8")
+        source = "file"
+        resolved_path = str(resolved)
+        prompt_name = resolved.stem
+
+    if not prompt_text.strip():
+        raise EvalError("Prompt text is empty.")
+
+    return prompt_text, {
+        "source": source,
+        "file_path": resolved_path,
+        "name": prompt_name,
+        "slug": slugify_name(prompt_name),
+        "sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -188,6 +303,12 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=DEFAULT_MODEL,
         help=f"OpenRouter model id. Default: {DEFAULT_MODEL}",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help="Optional text file containing the exact prompt to send instead of the built-in prompt.",
     )
     parser.add_argument(
         "--api-key",
@@ -238,7 +359,41 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=None,
-        help="Only evaluate the first N valid gallery images.",
+        help="Only evaluate the first N images after subset selection.",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Randomly sample this many gallery images before applying --limit.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=1501,
+        help="Seed used for reproducible random gallery sampling.",
+    )
+    parser.add_argument(
+        "--sample-manifest",
+        type=Path,
+        default=None,
+        help="JSON file containing a fixed list of gallery image filenames to evaluate.",
+    )
+    parser.add_argument(
+        "--write-sample-manifest",
+        type=Path,
+        default=None,
+        help="Optional path to write the selected gallery subset as a JSON manifest.",
+    )
+    parser.add_argument(
+        "--stratify-by",
+        default=None,
+        choices=["age"],
+        help=(
+            "Stratify gallery selection by this attribute so each class is equally represented. "
+            "Per-class count = min(class_size, limit // num_classes). "
+            "Cannot be combined with --sample-manifest or --sample-size."
+        ),
     )
     parser.add_argument(
         "--run-log-dir",
@@ -274,7 +429,7 @@ def load_market_attribute(mat_path: Path) -> Any:
     return data["market_attribute"]
 
 
-def list_gallery_items(images_dir: Path, limit: int | None = None) -> List[GalleryItem]:
+def list_gallery_items(images_dir: Path) -> List[GalleryItem]:
     files = sorted(images_dir.glob("*.jpg"))
     if not files:
         raise EvalError(f"No JPG files found in {images_dir}")
@@ -283,7 +438,7 @@ def list_gallery_items(images_dir: Path, limit: int | None = None) -> List[Galle
     current_pid: int | None = None
     class_index = -1
 
-    for image_path in files:
+    for source_index, image_path in enumerate(files):
         stem = image_path.stem
         pid_text = stem.split("_", 1)[0]
         try:
@@ -297,13 +452,104 @@ def list_gallery_items(images_dir: Path, limit: int | None = None) -> List[Galle
             current_pid = pid
 
         if pid > 0:
-            items.append(GalleryItem(image_path=image_path, pid=pid, class_index=class_index))
-            if limit is not None and len(items) >= limit:
-                break
+            items.append(
+                GalleryItem(
+                    image_path=image_path,
+                    pid=pid,
+                    class_index=class_index,
+                    source_index=source_index,
+                )
+            )
 
     if not items:
         raise EvalError(f"No valid positive-id gallery images found in {images_dir}")
     return items
+
+
+def write_sample_manifest(path: Path, gallery_items: Sequence[GalleryItem]) -> None:
+    payload = {
+        "count": len(gallery_items),
+        "images": [item.image_path.name for item in gallery_items],
+    }
+    write_json(path.resolve(), payload)
+
+
+def select_gallery_items(
+    gallery_items: Sequence[GalleryItem],
+    *,
+    sample_manifest: Path | None,
+    sample_size: int | None,
+    sample_seed: int,
+    limit: int | None,
+    stratify_by: str | None = None,
+    test_split: Any = None,
+) -> List[GalleryItem]:
+    selected = list(gallery_items)
+
+    if stratify_by is not None:
+        if sample_manifest is not None or sample_size is not None:
+            raise EvalError("--stratify-by cannot be combined with --sample-manifest or --sample-size")
+        if test_split is None:
+            raise EvalError("--stratify-by requires dataset ground truth (test_split)")
+
+        attr_values = attr_array(test_split, stratify_by)
+        by_class: Dict[int, List[GalleryItem]] = {}
+        for item in selected:
+            val = int(attr_values[item.class_index])
+            by_class.setdefault(val, []).append(item)
+
+        num_classes = len(by_class)
+        if num_classes == 0:
+            raise EvalError(f"No classes found for --stratify-by {stratify_by!r}")
+
+        per_class = min(len(items) for items in by_class.values())
+        if limit is not None and limit > 0:
+            per_class = min(per_class, limit // num_classes)
+        if per_class <= 0:
+            raise EvalError(f"--stratify-by {stratify_by!r}: computed per-class count is 0")
+
+        rng = random.Random(sample_seed)
+        selected = []
+        for _val, items in sorted(by_class.items()):
+            n = min(per_class, len(items))
+            selected.extend(rng.sample(items, n))
+        rng.shuffle(selected)
+    elif sample_manifest is not None:
+        manifest_path = sample_manifest.resolve()
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(manifest_data, dict):
+            image_names = manifest_data.get("images")
+        else:
+            image_names = manifest_data
+        if not isinstance(image_names, list) or not image_names:
+            raise EvalError(f"Sample manifest must contain a non-empty 'images' list: {manifest_path}")
+
+        by_name = {item.image_path.name: item for item in selected}
+        missing = [name for name in image_names if name not in by_name]
+        if missing:
+            raise EvalError(
+                f"Sample manifest references {len(missing)} missing images. First missing entry: {missing[0]}"
+            )
+        selected = [by_name[name] for name in image_names]
+    elif sample_size is not None:
+        if sample_size <= 0:
+            raise EvalError(f"--sample-size must be positive, got {sample_size}")
+        if sample_size > len(selected):
+            raise EvalError(
+                f"--sample-size {sample_size} exceeds available gallery size {len(selected)}"
+            )
+        rng = random.Random(sample_seed)
+        sampled_indices = sorted(rng.sample(range(len(selected)), sample_size))
+        selected = [selected[index] for index in sampled_indices]
+
+    if limit is not None:
+        if limit <= 0:
+            raise EvalError(f"--limit must be positive, got {limit}")
+        selected = selected[:limit]
+
+    if not selected:
+        raise EvalError("Subset selection produced no gallery images to evaluate.")
+    return selected
 
 
 def attr_array(split: Any, name: str) -> np.ndarray:
@@ -379,6 +625,36 @@ def parse_json_object(text: str) -> Dict[str, Any]:
 
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
+        # OpenRouter thinking models sometimes drop leading chars at the reasoning/content
+        # boundary. Try prefix recovery first, then fall back to regex key-value extraction.
+        stripped = text.strip()
+        if not stripped.startswith("{"):
+            tail = stripped.lstrip('{"')
+            if re.match(r"\s*:", tail):
+                try:
+                    parsed = json.loads('{"gender"' + tail)
+                    if isinstance(parsed, dict) and next(iter(parsed), None) == "gender":
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            if re.match(r"gender\"\s*:", tail):
+                for prefix in ("{", '{"'):
+                    try:
+                        parsed = json.loads(prefix + tail)
+                        if isinstance(parsed, dict) and next(iter(parsed), None) == "gender":
+                            return parsed
+                    except json.JSONDecodeError:
+                        pass
+        # Regex fallback: extract all "key": "value" pairs — handles any truncation depth.
+        # Safe here because our schema has only string values. Require more than one
+        # recovered pair so we do not silently accept a trivially partial object.
+        pairs = [
+            (key, value)
+            for key, value in re.findall(r'"([\w_]+)"\s*:\s*"([^"]*)"', text)
+            if key in EXPECTED_RESPONSE_KEYS
+        ]
+        if len(pairs) >= 2:
+            return {k: v for k, v in pairs}
         raise InvalidFormatError(f"Could not find JSON object in model response: {text!r}")
 
     try:
@@ -481,7 +757,7 @@ def validate_prediction(raw: Dict[str, Any]) -> Dict[str, int]:
     label_maps = {
         "gender": {"male": 1, "female": 2},
         "hair": {"short": 1, "long": 2},
-        "age": {"young": 1, "teenager": 2, "adult": 3, "old": 4},
+        "age": {"child": 1, "teenager": 2, "adult": 3, "old": 4},
         "up": {"long sleeve": 1, "short sleeve": 2},
         "down": {"long": 1, "short": 2},
         "clothes": {"dress": 1, "pants": 2},
@@ -529,6 +805,9 @@ def validate_prediction(raw: Dict[str, Any]) -> Dict[str, int]:
         value = normalized_raw[key]
         if isinstance(value, str):
             normalized = " ".join(value.strip().lower().split())
+            remap = LABEL_REMAP.get(key)
+            if remap and normalized in remap:
+                normalized = remap[normalized]
             if normalized not in mapping:
                 raise InvalidFormatError(
                     f"Unexpected label for '{key}': {value!r}. Expected one of {sorted(mapping)}"
@@ -559,6 +838,7 @@ def invalid_prediction() -> Dict[str, int]:
 def request_prediction(
     image_path: Path,
     model: str,
+    prompt_text: str,
     api_key: str,
     timeout: int,
     temperature: float,
@@ -582,7 +862,7 @@ def request_prediction(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": PROMPT},
+                    {"type": "text", "text": prompt_text},
                     {
                         "type": "image_url",
                         "image_url": {"url": encode_image_to_data_url(image_path)},
@@ -679,6 +959,7 @@ def collect_predictions(
     args: argparse.Namespace,
     run_log: Dict[str, Any],
     run_artifact_dir: Path,
+    prompt_text: str,
 ) -> List[Dict[str, int]]:
     predictions: List[Dict[str, int]] = []
     format_failures: List[Dict[str, Any]] = []
@@ -694,6 +975,7 @@ def collect_predictions(
             artifacts = request_prediction(
                 image_path=item.image_path,
                 model=args.model,
+                prompt_text=prompt_text,
                 api_key=args.api_key,
                 timeout=args.timeout,
                 temperature=args.temperature,
@@ -855,6 +1137,15 @@ def compute_metrics(gallery: np.ndarray, gt: Dict[str, np.ndarray]) -> Dict[str,
 
     metrics["up_color"] = float(np.mean(up_color_hits))
     metrics["down_color"] = float(np.mean(down_color_hits))
+
+    age_classes = np.unique(gt["age"])
+    per_class_acc = [
+        float(np.mean(gallery[:, 2][gt["age"] == cls] == cls))
+        for cls in age_classes
+        if (gt["age"] == cls).sum() > 0
+    ]
+    metrics["age_balanced"] = float(np.mean(per_class_acc)) if per_class_acc else 0.0
+
     metrics["average"] = float(np.mean(list(metrics.values())))
     return metrics
 
@@ -915,12 +1206,115 @@ def compute_error_breakdown(gallery: np.ndarray, gt: Dict[str, np.ndarray]) -> D
     }
 
 
-def write_metrics(path: Path, metrics: Dict[str, float], gallery_size: int, model: str) -> None:
+def decode_one_hot_labels(gt: Dict[str, np.ndarray], field_names: Sequence[str]) -> np.ndarray:
+    stacked = np.column_stack([gt[name] == 2 for name in field_names])
+    if stacked.size == 0:
+        return np.zeros(0, dtype=np.int32)
+    any_match = np.any(stacked, axis=1)
+    decoded = np.argmax(stacked, axis=1) + 1
+    decoded = decoded.astype(np.int32)
+    decoded[~any_match] = 0
+    return decoded
+
+
+def build_confusion_report(
+    name: str,
+    truth: np.ndarray,
+    pred: np.ndarray,
+    label_names: Dict[int, str],
+) -> Dict[str, Any]:
+    valid_truth_ids = sorted(label_names)
+    valid_mask = (pred != INVALID_PREDICTION_VALUE) & np.isin(truth, valid_truth_ids)
+    truth_valid = truth[valid_mask]
+    pred_valid = pred[valid_mask]
+
+    matrix: List[List[int]] = []
+    rows: List[Dict[str, Any]] = []
+    top_confusions: List[Dict[str, Any]] = []
+    valid_pred_mask = np.isin(pred_valid, valid_truth_ids)
+
+    for true_id in valid_truth_ids:
+        row_counts: List[int] = []
+        true_mask = truth_valid == true_id
+        support = int(np.sum(true_mask))
+        for pred_id in valid_truth_ids:
+            row_counts.append(int(np.sum(true_mask & (pred_valid == pred_id))))
+        matrix.append(row_counts)
+        rows.append(
+            {
+                "label": label_names[true_id],
+                "support": support,
+                "accuracy": (row_counts[true_id - 1] / support) if support else 0.0,
+                "predicted_counts": {
+                    label_names[pred_id]: row_counts[pred_id - 1] for pred_id in valid_truth_ids
+                },
+            }
+        )
+
+    predicted_distribution = {
+        label_names[pred_id]: int(np.sum(pred_valid == pred_id)) for pred_id in valid_truth_ids
+    }
+    invalid_prediction_count = int(np.sum(~valid_pred_mask))
+
+    for true_id in valid_truth_ids:
+        for pred_id in valid_truth_ids:
+            if true_id == pred_id:
+                continue
+            count = matrix[true_id - 1][pred_id - 1]
+            if count <= 0:
+                continue
+            support = rows[true_id - 1]["support"]
+            top_confusions.append(
+                {
+                    "true_label": label_names[true_id],
+                    "predicted_label": label_names[pred_id],
+                    "count": count,
+                    "rate_within_true_label": (count / support) if support else 0.0,
+                }
+            )
+
+    top_confusions.sort(
+        key=lambda item: (-item["count"], -item["rate_within_true_label"], item["true_label"], item["predicted_label"])
+    )
+
+    return {
+        "attribute": name,
+        "evaluated_samples": int(len(truth_valid)),
+        "invalid_prediction_count": invalid_prediction_count,
+        "labels": [label_names[label_id] for label_id in valid_truth_ids],
+        "matrix_true_rows_pred_cols": matrix,
+        "rows": rows,
+        "predicted_distribution": predicted_distribution,
+        "top_confusions": top_confusions[:5],
+    }
+
+
+def compute_analysis_report(gallery: np.ndarray, gt: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    up_color_truth = decode_one_hot_labels(gt, UP_COLOR_GT_FIELDS)
+    down_color_truth = decode_one_hot_labels(gt, DOWN_COLOR_GT_FIELDS)
+    return {
+        "age": build_confusion_report("age", gt["age"], gallery[:, 2], AGE_LABELS),
+        "up_color": build_confusion_report("up_color", up_color_truth, gallery[:, 10], UP_COLOR_LABELS),
+        "down_color": build_confusion_report(
+            "down_color", down_color_truth, gallery[:, 11], DOWN_COLOR_LABELS
+        ),
+    }
+
+
+def write_metrics(
+    path: Path,
+    metrics: Dict[str, float],
+    gallery_size: int,
+    model: str,
+    analysis_report: Dict[str, Any] | None = None,
+) -> None:
     payload = {
         "model": model,
         "gallery_size": gallery_size,
         "metrics": metrics,
     }
+    if analysis_report is not None:
+        payload["analysis_report"] = analysis_report
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -930,6 +1324,7 @@ def print_metrics(metrics: Dict[str, float]) -> None:
     ordered = [
         "gender",
         "age",
+        "age_balanced",
         "hair",
         "up",
         "down",
@@ -944,6 +1339,28 @@ def print_metrics(metrics: Dict[str, float]) -> None:
     ]
     for key in ordered:
         print(f"{key:>10}: {metrics[key]:.6f}")
+
+
+def print_analysis_report(analysis_report: Dict[str, Any]) -> None:
+    print("\nAnalysis")
+    print("--------")
+    for attr_name in ("age", "up_color", "down_color"):
+        report = analysis_report[attr_name]
+        print(
+            f"{attr_name}: evaluated={report['evaluated_samples']}, "
+            f"invalid_pred={report['invalid_prediction_count']}"
+        )
+        if not report["top_confusions"]:
+            print("  top_confusions: none")
+            continue
+        summary = ", ".join(
+            (
+                f"{item['true_label']}->{item['predicted_label']} "
+                f"({item['count']}, {item['rate_within_true_label']:.3f})"
+            )
+            for item in report["top_confusions"]
+        )
+        print(f"  top_confusions: {summary}")
 
 
 def json_safe(value: Any) -> Any:
@@ -1014,6 +1431,11 @@ def main() -> int:
 
         mat_path, images_dir, output_mat, metrics_json, run_log_dir = resolve_paths(args)
         run_artifact_dir = make_run_artifact_dir(run_log_dir, args.model)
+        prompt_text, prompt_info = load_prompt(args.prompt_file)
+        prompt_artifact_path = run_artifact_dir / "prompt.txt"
+        prompt_metadata_path = run_artifact_dir / "prompt_metadata.json"
+        prompt_artifact_path.write_text(prompt_text, encoding="utf-8")
+        write_json(prompt_metadata_path, prompt_info)
         run_log["resolved_paths"] = {
             "dataset_root": str(dataset_root),
             "mat_path": str(mat_path),
@@ -1024,19 +1446,46 @@ def main() -> int:
             "run_artifact_dir": str(run_artifact_dir),
         }
         run_log["model"] = args.model
+        run_log["prompt"] = prompt_info
         require_path(mat_path, "Attribute MAT file")
         require_path(images_dir, "Gallery image directory")
 
         market = load_market_attribute(mat_path)
-        gallery_items = list_gallery_items(images_dir, limit=args.limit)
+        all_gallery_items = list_gallery_items(images_dir)
+        gallery_items = select_gallery_items(
+            all_gallery_items,
+            sample_manifest=args.sample_manifest,
+            sample_size=args.sample_size,
+            sample_seed=args.sample_seed,
+            limit=args.limit,
+            stratify_by=args.stratify_by,
+            test_split=market.test if args.stratify_by else None,
+        )
+        if args.write_sample_manifest is not None:
+            write_sample_manifest(args.write_sample_manifest, gallery_items)
         run_log["gallery"] = {
             "num_items": len(gallery_items),
             "first_image": str(gallery_items[0].image_path),
             "last_image": str(gallery_items[-1].image_path),
+            "selection": {
+                "available_items": len(all_gallery_items),
+                "limit": args.limit,
+                "sample_manifest": (
+                    str(args.sample_manifest.resolve()) if args.sample_manifest is not None else None
+                ),
+                "sample_seed": args.sample_seed,
+                "sample_size": args.sample_size,
+                "stratify_by": args.stratify_by,
+                "write_sample_manifest": (
+                    str(args.write_sample_manifest.resolve())
+                    if args.write_sample_manifest is not None
+                    else None
+                ),
+            },
         }
         gt = build_ground_truth(market.test, gallery_items)
 
-        predictions = collect_predictions(gallery_items, args, run_log, run_artifact_dir)
+        predictions = collect_predictions(gallery_items, args, run_log, run_artifact_dir, prompt_text)
         gallery = predictions_to_matrix(predictions)
 
         output_mat.parent.mkdir(parents=True, exist_ok=True)
@@ -1044,16 +1493,22 @@ def main() -> int:
 
         metrics = compute_metrics(gallery, gt)
         error_breakdown = compute_error_breakdown(gallery, gt)
+        analysis_report = compute_analysis_report(gallery, gt)
         metrics_json.parent.mkdir(parents=True, exist_ok=True)
-        write_metrics(metrics_json, metrics, len(gallery_items), args.model)
+        write_metrics(metrics_json, metrics, len(gallery_items), args.model, analysis_report)
+        write_json(run_artifact_dir / "analysis_report.json", analysis_report)
         run_log["outputs"] = {
             "output_mat": str(output_mat),
             "metrics_json": str(metrics_json),
+            "analysis_report": str(run_artifact_dir / "analysis_report.json"),
+            "prompt_text": str(prompt_artifact_path),
+            "prompt_metadata": str(prompt_metadata_path),
             "api_request_template": str(run_artifact_dir / "api_request_template.json"),
             "api_response_dir": str(run_artifact_dir / "api_responses"),
         }
         run_log["metrics"] = metrics
         run_log["error_breakdown"] = error_breakdown
+        run_log["analysis_report"] = analysis_report
         run_log["status"] = "success"
 
         print(f"\nSaved gallery predictions to: {output_mat}")
@@ -1066,6 +1521,7 @@ def main() -> int:
                 print(f"{key}: {value:.6f}")
             else:
                 print(f"{key}: {value}")
+        print_analysis_report(analysis_report)
         exit_code = 0
     except KeyboardInterrupt:
         run_log["status"] = "aborted"

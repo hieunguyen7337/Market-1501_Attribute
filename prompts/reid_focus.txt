@@ -1,0 +1,30 @@
+Label every attribute of the main pedestrian in this image.
+If multiple people are visible, focus on the most prominent (largest/most central) person.
+If a body region is occluded or cropped, infer from whatever is visible.
+
+Prioritize visible ReID cues:
+- accessories first: backpack, bag, handbag, hat
+- clothing structure: dress vs pants, sleeve length, lower-body length
+- dominant garment colors for upper and lower clothing
+
+If age is visually uncertain, make the best guess, but do not let an uncertain age guess change clothing, accessory, or color decisions.
+
+Return only a raw JSON object with these exact keys and text values:
+
+{
+  "gender":                    "male" | "female",
+  "hair":                      "short" | "long",
+  "age":                       "child" | "teenager" | "adult" | "old",
+  "clothing_type":             "dress" | "pants" | "shorts" | "skirt",
+  "upper_body_clothes":        "long sleeve" | "short sleeve",
+  "lower_body_clothes":        "long" | "short",
+  "hat":                       "no" | "yes",
+  "backpack":                  "no" | "yes",
+  "bag":                       "no" | "yes",
+  "handbag":                   "no" | "yes",
+  "upper_body_clothes_color":  "black" | "white" | "red" | "purple" | "gray" | "blue" | "green" | "yellow" | "pink" | "orange" | "brown",
+  "lower_body_clothes_color":  "black" | "white" | "pink" | "gray" | "blue" | "green" | "brown" | "yellow" | "purple" | "red"
+}
+
+For upper_body_clothes_color and lower_body_clothes_color, choose the dominant color.
+No markdown, no explanation - raw JSON only.
